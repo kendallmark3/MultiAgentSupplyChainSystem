@@ -21,7 +21,7 @@ if [ -f "$REPO_ROOT/.env" ]; then
     set -a && source "$REPO_ROOT/.env" && set +a
 fi
 export CHROMA_DB_PATH="${CHROMA_DB_PATH:-$REPO_ROOT/database/chroma_db}"
-export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-cloudassiciate}"
+export GOOGLE_CLOUD_PROJECT="${GOOGLE_CLOUD_PROJECT:-}"
 
 mkdir -p "$REPORTS_DIR"
 
