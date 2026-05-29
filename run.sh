@@ -66,6 +66,24 @@ fi
 echo "✅ Environment configured"
 echo ""
 
+# ============================================================================
+# Pre-flight Tests
+# ============================================================================
+
+echo "🔍 Running pre-flight checks..."
+echo ""
+
+if ! python3 -m pytest tests/test_preflight.py -q --tb=short 2>&1; then
+    echo ""
+    echo "❌ Pre-flight checks failed. Fix the issues above before starting services."
+    echo "   Run:  pytest tests/test_preflight.py -v  for details"
+    exit 1
+fi
+
+echo ""
+echo "✅ All pre-flight checks passed"
+echo ""
+
 mkdir -p logs
 
 # ============================================================================
