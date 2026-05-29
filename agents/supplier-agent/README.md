@@ -1,272 +1,164 @@
 # Supplier Agent
 
-Autonomous inventory search agent using **AlloyDB AI** with ScaNN vector search for high-speed semantic matching.
+Autonomous inventory search agent using **ChromaDB** with cosine vector search for semantic part matching.
 
-## The Problem
+No server. No cloud account. No cost.
 
-Searching millions of parts by exact text match is:
-- Brittle ("Widget X-9" vs "WidgetX9")
-- Slow (full table scans)
-- Language-dependent (English vs Spanish)
+---
 
-## The Solution: Semantic Vector Search
+## What Changed and Why
 
-This agent uses embeddings + ScaNN:
-1. Convert part description to 768-dimensional vector
-2. Search for nearest vectors using cosine distance (`<=>` operator)
-3. Return best match with supplier and confidence
-4. Results in milliseconds, even with millions of parts
+The original implementation used **AlloyDB AI + ScaNN + Vertex AI text-embedding-005**. That stack is production-grade and fast at scale — but AlloyDB costs ~$130–160/month just for the instance, billed by uptime, not by query volume.
 
-## Technology
+For a POC running 100 manual test runs per month, you were paying $150 to run $0.50 worth of queries.
 
-- **AlloyDB AI** — PostgreSQL-compatible with AI extensions
-- **AlloyDB Python Connector** — Secure connection without Auth Proxy (IAM auth, managed SSL)
-- **ScaNN** (Scalable Nearest Neighbors) — Vector quantization for speed
-- **Vertex AI Embeddings** — `text-embedding-005` model
-- **pg8000** — Pure-Python PostgreSQL driver
-- **A2A Protocol** — Agent discovery and communication
+**The replacement:**
+
+| Before | After |
+|---|---|
+| AlloyDB Python Connector | ChromaDB (embedded, no server) |
+| Vertex AI text-embedding-005 (768-dim) | sentence-transformers `all-MiniLM-L6-v2` (384-dim) |
+| GCP credentials required | No credentials required |
+| ~$130–160/month | $0/month |
+
+The public API is identical — `get_embedding()` and `find_supplier()` have the same signatures. Nothing else in the system changed.
+
+**Production upgrade path:** When volume demands a managed service, swap the `inventory.py` internals for pgvector on RDS, OpenSearch Serverless, or Bedrock Knowledge Base. One file. The agents, A2A cards, and orchestration are untouched.
+
+---
+
+## How It Works
+
+```
+Query text: "cardboard shipping boxes warehouse"
+        │
+        ▼
+sentence-transformers (local, ~80MB model)
+        │  generates 384-dimensional embedding vector
+        ▼
+ChromaDB cosine search
+        │  compares against 20 pre-seeded inventory embeddings
+        │  persisted in database/chroma_db/
+        ▼
+Returns: ("Cardboard Shipping Box Large", "Packaging Solutions Inc", 0.08)
+                 part_name                    supplier_name           distance
+        │
+        ▼
+Confidence: 96.0%   (1 - distance/2 × 100)
+```
+
+ChromaDB uses the same cosine distance metric as AlloyDB ScaNN — distance range [0, 2], where 0 is identical and 2 is opposite. The `compute_confidence` function in `agent_executor.py` is unchanged.
+
+---
 
 ## Files
 
-- `inventory.py` — AlloyDB ScaNN query logic (connects via Python Connector)
-- `agent_executor.py` — A2A protocol bridge
-- `main.py` — FastAPI server (port 8082)
-- `agent_card_skeleton.json` — Template for agent card
-- `requirements.txt` — Python dependencies
+- [inventory.py](inventory.py) — ChromaDB + sentence-transformers vector search (replaces AlloyDB)
+- [agent_executor.py](agent_executor.py) — A2A protocol bridge + input guardrails (unchanged)
+- [main.py](main.py) — FastAPI server (port 8082)
+- [requirements.txt](requirements.txt) — `chromadb`, `sentence-transformers`
 
-## ScaNN Query
-
-The core search uses PostgreSQL's `<=>` cosine distance operator:
-
-```python
-sql = """
-SELECT part_name, supplier_name,
-       (part_embedding <=> %s::vector) as distance
-FROM inventory
-ORDER BY part_embedding <=> %s::vector
-LIMIT 1;
-"""
-cursor.execute(sql, (embedding_str, embedding_str))
-```
-
-> **Critical:** The `::vector` cast is mandatory when using `%s` placeholders with vector operators. Without it, PostgreSQL throws: `operator does not exist: vector <=> double precision`
-
-## Why ScaNN?
-
-Standard vector search (HNSW) is memory-intensive. ScaNN uses vector quantization:
-
-- **10x faster** filtered search
-- **4x faster** standard search  
-- **3x smaller** memory footprint
-
-The index fits in CPU L2 cache for maximum speed.
+---
 
 ## Running
 
-### Via Master Script
+### Via master script (recommended)
 
 ```bash
 cd ../..
 sh run.sh
 ```
 
+On first run, `run.sh` automatically seeds ChromaDB with 20 inventory items. Subsequent starts are instant.
+
 ### Manually
 
 ```bash
 pip install -r requirements.txt
-export GOOGLE_CLOUD_PROJECT=$(gcloud config get-value project)
-export DB_PASS='your-password'
-export ALLOYDB_REGION='us-central1'
-export ALLOYDB_CLUSTER='my-cluster'
-export ALLOYDB_INSTANCE='my-instance'
+# No other environment variables needed for the supplier agent
 uvicorn main:app --host 0.0.0.0 --port 8082
 ```
 
-## Database Connection
+The agent auto-seeds ChromaDB if the collection is empty.
 
-Connects via the AlloyDB Python Connector (no Auth Proxy needed):
+### Standalone test
 
-```python
-from google.cloud.alloydbconnector import Connector
-
-connector = Connector()
-conn = connector.connect(
-    inst_uri,         # Full instance URI
-    "pg8000",
-    user="postgres",
-    password=os.environ["DB_PASS"],
-    db="postgres",
-    ip_type="PUBLIC",  # Use "PRIVATE" for Cloud Run
-)
+```bash
+python inventory.py
 ```
 
-## A2A Agent Card
-
-The agent card is already included at `agent_card.json`. Review and customize as needed.
-
-Exposed at `http://localhost:8082/.well-known/agent-card.json`:
-
+Output:
 ```json
 {
-  "name": "Acme Supplier Agent",
-  "description": "Autonomous fulfillment for industrial parts",
-  "skills": [{
-    "id": "search_inventory",
-    "name": "Search Inventory",
-    "description": "Find supplier using AlloyDB ScaNN vector search"
-  }]
+  "part": "Cardboard Shipping Box Large",
+  "supplier": "Packaging Solutions Inc",
+  "distance": 0.0812,
+  "match_confidence": "95.9%"
 }
 ```
 
-## Request Format
+---
+
+## Request / Response Format
 
 Send via A2A protocol:
 
 ```json
-{
-  "query": "Industrial Widget"
-}
+{ "query": "cardboard shipping boxes warehouse" }
 ```
 
-Or with pre-computed embedding:
+Response:
 
 ```json
 {
-  "embedding": [0.1, 0.2, ..., 0.05]  // 768-dimensional vector
+  "part": "Cardboard Shipping Box Large",
+  "supplier": "Packaging Solutions Inc",
+  "match_confidence": "95.9%"
 }
 ```
 
-## Response Format
-
-```json
-{
-  "part": "Industrial Widget X-9",
-  "supplier": "Acme Corp",
-  "match_confidence": "98.5%"
-}
-```
+---
 
 ## Environment Variables
 
+| Variable | Required | Description |
+|---|---|---|
+| `CHROMA_DB_PATH` | No | Path to ChromaDB storage (default: `database/chroma_db` from repo root) |
+| `EMBEDDING_MODEL` | No | sentence-transformers model (default: `all-MiniLM-L6-v2`) |
+
+No GCP credentials. No database password. No API key.
+
+---
+
+## Seeding the Database
+
+ChromaDB is seeded automatically on first run. To manually re-seed (or reset to a clean state):
+
 ```bash
-# Required
-export GOOGLE_CLOUD_PROJECT=your-project-id
-export DB_PASS=your-database-password
-export ALLOYDB_REGION=us-central1
-export ALLOYDB_CLUSTER=my-cluster
-export ALLOYDB_INSTANCE=my-instance
-
-# Optional
-export SUPPLIER_AGENT_URL=http://localhost:8082
+python ../../database/seed.py
 ```
 
-## Embedding Generation
+This re-generates embeddings for all 20 inventory items and rebuilds the collection from scratch.
 
-Uses Google Gen AI SDK to convert text to vectors:
-
-```python
-from google import genai
-from google.genai.types import EmbedContentConfig
-
-client = genai.Client(vertexai=True, project="your-project", location="us-central1")
-response = client.models.embed_content(
-    model="text-embedding-005",
-    contents=["Industrial Widget"],
-    config=EmbedContentConfig(task_type="RETRIEVAL_QUERY", output_dimensionality=768)
-)
-vector = response.embeddings[0].values  # 768 dimensions
-```
-
-## ScaNN Index Configuration
-
-Created during database setup in AlloyDB Studio:
-
-```sql
-CREATE INDEX idx_inventory_scann
-ON inventory USING scann (part_embedding cosine)
-WITH (
-    num_leaves=5,      -- Adjust based on dataset size (sqrt of row count)
-    quantizer='sq8'    -- 8-bit scalar quantization
-);
-```
-
-## Customization
-
-### Tune for Dataset Size
-
-For production with millions of parts:
-
-```sql
-WITH (
-    num_leaves=1000,           -- sqrt(1M) ≈ 1000
-    quantizer='sq8',
-    num_leaves_to_search=10    -- Search top 10 leaves
-);
-```
-
-### Change Distance Metric
-
-```sql
-USING scann (part_embedding l2)  -- L2 distance instead of cosine
-```
-
-### Return Top N Results
-
-```sql
-LIMIT 5  -- Return top 5 matches instead of 1
-```
-
-### Add Filtering
-
-```sql
-WHERE stock_level > 0  -- Only in-stock items
-ORDER BY part_embedding <=> %s::vector
-```
+---
 
 ## Troubleshooting
 
-### Connection refused
+**Slow startup on first run**
+The `all-MiniLM-L6-v2` model (~80MB) downloads once and caches in `~/.cache/torch/sentence_transformers/`. Every subsequent start is instant.
 
-Check your AlloyDB instance URI and ensure Public IP is enabled:
+**Empty collection / no results**
 ```bash
-gcloud alloydb instances list --format="value(name,state)"
+python ../../database/seed.py
 ```
 
-### Authentication failed
+**ChromaDB path not found**
+Set `CHROMA_DB_PATH` explicitly in your `.env`, or let it default — `inventory.py` creates the directory automatically.
 
-Check DB_PASS:
-```bash
-echo $DB_PASS  # Should match password from setup
-```
+---
 
-### No results returned
+## References
 
-Verify data was seeded:
-```sql
-SELECT COUNT(*) FROM inventory;
-```
-
-Should return 20.
-
-### Slow queries
-
-Check index exists:
-```sql
-\di  -- List indexes
-```
-
-Should see `idx_inventory_scann`.
-
-## Performance
-
-Typical query latency:
-- **< 5ms** for 10K parts
-- **< 50ms** for 1M parts
-- **< 500ms** for 100M parts (with tuned index)
-
-## Learn More
-
-- [AlloyDB AI Documentation](https://cloud.google.com/alloydb/docs/ai)
-- [AlloyDB Python Connector](https://github.com/GoogleCloudPlatform/alloydb-python-connector)
-- [ScaNN Overview](https://cloud.google.com/alloydb/docs/ai/work-with-embeddings)
-- [Vertex AI Embeddings](https://cloud.google.com/vertex-ai/docs/generative-ai/embeddings/get-text-embeddings)
+- [ChromaDB Documentation](https://docs.trychroma.com/)
+- [sentence-transformers: all-MiniLM-L6-v2](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+- [A2A Protocol](https://google.github.io/A2A/)
