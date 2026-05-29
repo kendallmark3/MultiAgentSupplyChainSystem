@@ -70,17 +70,16 @@ echo ""
 # Pre-flight Tests
 # ============================================================================
 
-echo "🔍 Running pre-flight checks..."
+echo "🔍 Running pre-flight checks (report saved to tests/reports/)..."
 echo ""
 
-if ! python3 -m pytest tests/test_preflight.py -q --tb=short 2>&1; then
+if ! sh "$SCRIPT_DIR/tests/run_tests.sh" preflight; then
     echo ""
     echo "❌ Pre-flight checks failed. Fix the issues above before starting services."
-    echo "   Run:  pytest tests/test_preflight.py -v  for details"
+    echo "   Details: open tests/reports/latest.html"
     exit 1
 fi
 
-echo ""
 echo "✅ All pre-flight checks passed"
 echo ""
 
