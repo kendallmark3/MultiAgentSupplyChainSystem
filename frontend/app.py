@@ -694,13 +694,13 @@ async def run_workflow_with_events(image_bytes: bytes):
 
 
 # ── MCP Integration ──────────────────────────────────────────────────────────
-MCP_USER_EMAIL = "syedshabbeerbasha08@gmail.com"
-SHEETS_URL = "https://docs.google.com/spreadsheets/d/1w-zhfJtPmptPgv8ctvWfNyGYJq5mEB-FYdsI7913Dds/edit"
-SHEET_ID = "1w-zhfJtPmptPgv8ctvWfNyGYJq5mEB-FYdsI7913Dds"
+MCP_USER_EMAIL = os.environ.get("MCP_USER_EMAIL", "")
+SHEETS_URL = os.environ.get("GOOGLE_SHEETS_URL", "")
+SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
 OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
-USER_EMAIL = "syedshabbeerbasha08@gmail.com"
+USER_EMAIL = os.environ.get("MCP_USER_EMAIL", "")
 
 
 async def run_mcp_integrations(

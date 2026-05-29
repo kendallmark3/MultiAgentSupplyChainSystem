@@ -8,7 +8,7 @@
 
 An end-to-end **enterprise-grade agentic supply chain system** — combining computer vision, semantic vector search, governance, observability, logistics, and real-world MCP integrations to automate physical inventory management.
 
-**Live Demo (GCP):** https://visual-commerce-demo-693699778723.us-central1.run.app/
+**Deploy your own:** `sh deploy/deploy.sh` (GCP) or `sh agentcore/deploy/deploy-agentcore.sh` (AWS)
 
 ---
 
@@ -446,3 +446,4 @@ gcloud services enable aiplatform.googleapis.com
 
 ## License
 Apache-2.0
+

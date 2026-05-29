@@ -2,40 +2,38 @@
 
 ## Project
 Name: MultiAgentSupplyChainSystem
-Stack: Python · FastAPI · Gemini 3 Flash · Prophet · AlloyDB · Cloud Run · Alpine.js
+Stack: Python · FastAPI · Gemini 3 Flash · ChromaDB · sentence-transformers · AWS AgentCore · Alpine.js
 
 ## What This System Does
 Upload a warehouse shelf photo → 4 AI agents collaborate:
 1. Vision Agent — counts items using Gemini 3 Flash + code execution
-2. Supplier Agent — finds best matching part via AlloyDB ScaNN vector search
-3. Reorder Agent — uses Prophet ML to predict days-to-stockout vs lead time
-4. Logistics Agent — calculates shipping cost, carrier, ETA
+2. Supplier Agent — finds best matching part via ChromaDB cosine vector search (local, free)
+3. Logistics Agent — calculates shipping cost, carrier, ETA
+4. Control Tower — orchestrates all agents via A2A protocol, streams results via WebSocket
 Then: Gmail + Google Calendar + Google Sheets confirmation via MCP
 
-## Current Sprint Goal
-Intent: Add a forecast dashboard showing Prophet charts and CRITICAL/LOW/OK status for all 52 inventory items in real time
+## Current Branch
+Branch: feature/AgentCore
+Origin: https://github.com/kendallmark3/MultiAgentSupplyChainSystem.git
 
-## Context
-- Live demo: https://visual-commerce-demo-693699778723.us-central1.run.app
+## Architecture Notes
+- AlloyDB replaced with ChromaDB + sentence-transformers (free, local, no server)
+- Seed ChromaDB: python database/seed.py
+- AgentCore migration layer in agentcore/ — deploy to AWS with sh agentcore/deploy/deploy-agentcore.sh
 - Control tower runs on port 8080, agents on 8081/8082/8083
-- Agent URLs must be set as Cloud Run env vars after every deploy
-- Prophet usage data: agents/reorder-agent/data/usage_history.json (52 items)
-- Reorder agent: agents/reorder-agent/forecaster.py
-- Frontend: frontend/static/app.js + index.html (Alpine.js)
-- Deploy: sh deploy/deploy.sh then update env vars with gcloud
+- Test report server on port 9090 — sh tests/run_tests.sh
+
+## MCP Config (set in .env — never hardcode)
+- MCP_USER_EMAIL — Gmail and Calendar confirmations go here
+- GOOGLE_SHEET_ID — order log spreadsheet ID
+- OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OAUTH_REFRESH_TOKEN
+
+## Running Locally
+sh run.sh            # auto-seeds ChromaDB, runs preflight tests, starts all 4 services
+sh tests/run_tests.sh all   # full test suite + HTML report at http://localhost:9090
 
 ## Patterns
 - All agents use A2A protocol — discoverable via /.well-known/agent-card.json
 - WebSocket events drive the UI — add new events in app.py, handle in app.js
-- Reorder decision: days_until_stockout < lead_time_days → CRITICAL → order
-- After every deploy: gcloud run services update visual-commerce-demo --region us-central1 --update-env-vars VISION_AGENT_URL=...,SUPPLIER_AGENT_URL=...,LOGISTICS_AGENT_URL=...
-
-## Last Session (May 9)
-Built: Prophet reorder agent — predicts stockout, gates order pipeline, UI card live
-Commit: feat: reorder assessment card live in UI with Prophet ML
-
-## Next Saturday Prep
-- [ ] Write intent Friday night and update this file
-- [ ] Pull latest main before 10 AM
-- [ ] Verify app runs: curl https://visual-commerce-demo-693699778723.us-central1.run.app/api/health
-- [ ] Join voice channel at 10 AM sharp
+- Pre-flight tests run before every sh run.sh start
+- Credentials always via os.environ.get() — never hardcoded
