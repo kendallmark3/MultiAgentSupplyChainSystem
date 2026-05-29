@@ -341,6 +341,24 @@
               </div>
             </div>
 
+            <!-- Reorder Assessment -->
+            <div class="final-card" x-show="reorderResult!==null&&reorderResult!==undefined" x-transition>
+              <div class="fc-head">
+                <div class="fc-head-icon" x-text="reorderResult?.status==='CRITICAL'?'🔴':reorderResult?.status==='LOW'?'🟡':'🟢'"></div>
+                <div class="fc-head-title">Reorder Assessment</div>
+                <div class="fc-head-tag" x-text="'Prophet ML · '+reorderResult?.status" :style="reorderResult?.status==='CRITICAL'?'background:#fee2e2;color:#991b1b':reorderResult?.status==='LOW'?'background:#fef3c7;color:#92400e':'background:#d1fae5;color:#065f46'"></div>
+              </div>
+              <div class="fc-body">
+                <div class="fc-row"><span class="fc-label">Status</span><span class="fc-val" x-text="reorderResult?.status"></span></div>
+                <div class="fc-row"><span class="fc-label">Days to stockout</span><span class="fc-val" x-text="reorderResult?.days_until_stockout+'d'"></span></div>
+                <div class="fc-row"><span class="fc-label">Lead time</span><span class="fc-val" x-text="reorderResult?.lead_time_days+'d'"></span></div>
+                <div class="fc-row"><span class="fc-label">Reorder point</span><span class="fc-val" x-text="reorderResult?.reorder_point+' units'"></span></div>
+                <div class="fc-row"><span class="fc-label">Recommended qty</span><span class="fc-val accent" x-text="reorderResult?.recommended_qty+' units'"></span></div>
+                <div class="fc-row"><span class="fc-label">Prophet predicts</span><span class="fc-val" x-text="reorderResult?.predicted_daily_usage+' units/day'"></span></div>
+                <div class="fc-row"><span class="fc-label">Order triggered</span><span class="fc-val" :class="reorderResult?.should_order?'green':''" x-text="reorderResult?.should_order?'Yes — placed':'No — stock healthy'"></span></div>
+                <div class="fc-row" style="flex-direction:column;gap:4px"><span class="fc-label">Reason</span><span class="fc-val" style="font-size:12px;opacity:0.8" x-text="reorderResult?.reason"></span></div>
+              </div>
+            </div>
             <!-- Shipping -->
             <div class="final-card" x-show="logisticsResult!==null&&logisticsResult!==undefined" x-transition>
               <div class="fc-head"><div class="fc-head-icon">🚚</div><div class="fc-head-title">Shipping Details</div><div class="fc-head-tag">Logistics Agent</div></div>
@@ -354,6 +372,29 @@
             </div>
 
             <!-- Summary -->
+            <!-- WEGA Execution Timeline -->
+            <div class="final-card" x-show="executionSummary!==null&&executionSummary!==undefined" x-transition>
+              <div class="fc-head">
+                <div class="fc-head-icon">🔍</div>
+                <div class="fc-head-title">WEGA Execution Trail</div>
+                <div class="fc-head-tag" x-text="executionSummary?.overall_status==='passed'?'All stages passed':'Check stages'" :style="executionSummary?.overall_status==='passed'?'background:#d1fae5;color:#065f46':'background:#fee2e2;color:#991b1b'"></div>
+              </div>
+              <div class="fc-body">
+                <div class="fc-row"><span class="fc-label">Session</span><span class="fc-val" x-text="executionSummary?.session_id"></span></div>
+                <div class="fc-row"><span class="fc-label">Intent</span><span class="fc-val" x-text="executionSummary?.intent"></span></div>
+                <div class="fc-row"><span class="fc-label">Total time</span><span class="fc-val" x-text="executionSummary?.total_duration_ms+'ms'"></span></div>
+                <template x-for="(stage, name) in executionSummary?.stages" :key="name">
+                  <div class="fc-row" style="flex-direction:column;gap:4px;border-left:2px solid var(--color-border-tertiary);padding-left:8px;margin:4px 0">
+                    <div style="display:flex;align-items:center;gap:8px">
+                      <span x-text="stage.status==='passed'?'✅':stage.status==='failed'?'❌':stage.status==='running'?'🔄':'⏳'" style="font-size:14px"></span>
+                      <span class="fc-label" x-text="name" style="font-weight:600"></span>
+                      <span style="font-size:11px;color:var(--color-text-secondary)" x-text="stage.duration_ms?stage.duration_ms+'ms':''"></span>
+                    </div>
+                    <span class="fc-val" style="font-size:12px;opacity:0.8" x-text="stage.output_summary"></span>
+                  </div>
+                </template>
+              </div>
+            </div>
             <div class="final-card">
               <div class="fc-head"><div class="fc-head-icon">📊</div><div class="fc-head-title">Pipeline Summary</div></div>
               <div class="sum-stats">

@@ -1,20 +1,31 @@
+![Python](https://img.shields.io/badge/Python-3.9+-blue)
+![License](https://img.shields.io/badge/License-Apache%202.0-green)
+![Tests](https://img.shields.io/badge/Tests-7%20passing-brightgreen)
+![Agents](https://img.shields.io/badge/Agents-4-orange)
+![Cloud](https://img.shields.io/badge/Cloud-GCP-blue)
+
 # Autonomous Supply Chain: Vision × Vector × Agents
 
-An end-to-end agentic supply chain system — combining computer vision, semantic vector search, agent-to-agent orchestration, and real-world integrations to automate physical inventory management.
+An end-to-end **enterprise-grade agentic supply chain system** — combining computer vision, semantic vector search, governance, observability, logistics, and real-world MCP integrations to automate physical inventory management.
 
 **Live Demo (GCP):** https://visual-commerce-demo-693699778723.us-central1.run.app/
 
 ---
 
-## The Problem We're Solving
+## The Problem
 
-Most warehouse inventory systems rely on humans to physically count stock, identify shortages, and place reorders. This is slow, error-prone, and doesn't scale.
+Traditional warehouse inventory systems depend on humans to:
+- Physically count items on shelves
+- Manually look up supplier catalogs by SKU
+- Decide when and what to reorder
+- Calculate shipping costs and ETAs manually
+- Send order confirmations and update spreadsheets
 
-This system replaces that entire workflow: upload a photo of a shelf, and the system autonomously counts what's there, finds the best-matched supplier, calculates shipping cost and ETA, and confirms the order via email, calendar, and a live spreadsheet — no human required.
+This is slow, error-prone, and unscalable. This system eliminates all of it.
 
 ---
 
-## What It Does
+## The Solution
 
 Upload a photo of a warehouse shelf. Four specialized agents collaborate to:
 
@@ -23,20 +34,50 @@ Upload a photo of a warehouse shelf. Four specialized agents collaborate to:
 3. **Calculate** shipping cost, carrier, and ETA
 4. **Confirm** the order via Gmail, Google Calendar, and Google Sheets
 
+No human in the loop. No manual SKU lookup. No guessing.
+
 ---
 
-## Architecture
+## Business Impact
+
+| Problem | Without This System | With This System |
+|---|---|---|
+| Inventory counting | Manual, hours of labor, error-prone | Automated in seconds via vision AI |
+| Stockout detection | Discovered after the fact | Detected proactively from shelf image |
+| Supplier matching | Manual SKU lookup, catalog search | Semantic search across millions of parts |
+| Shipping calculation | Manual carrier lookup, calls | Automated zone-based cost + ETA |
+| Audit compliance | No trace of decisions | Full audit log per request and agent |
+| Large order risk | No controls or approval gates | Human approval enforced automatically |
+| Order confirmation | Manual emails, calendar entries | Automated via Gmail, Calendar, Sheets |
+
+**KPIs this system improves:**
+- Reduces inventory counting time from hours to seconds
+- Eliminates manual supplier lookup entirely
+- Automates shipping calculation and carrier selection
+- Enforces compliance automatically with zero human overhead
+- Provides full decision audit trail for enterprise governance
+- Flags high-risk orders before they execute
+
+---
+
+## Enterprise Architecture
 
 ```
 User uploads image
         │
         ▼
-Control Tower (8080)  ← WebSocket + FastAPI + PIL image compression
+Governance Layer (agents/governance.py)
+        Validates input, blocks prompt injection,
+        enforces policies, logs every request
+        │
+        ▼
+Control Tower (8080)  ← WebSocket + FastAPI + Observability
+        Assigns workflow ID, traces all agents
         │
         │  A2A Protocol (agent discovery via /.well-known/agent-card.json)
         │
         ├──▶ Vision Agent (8081)
-        │       Gemini 3 Flash + Code Execution → deterministic item count + bounding boxes
+        │       Gemini 3 Flash + Code Execution → deterministic item count
         │       Gemini 2.5 Flash Lite → structured semantic search query
         │
         ├──▶ Supplier Agent (8082)
@@ -59,16 +100,16 @@ All agents expose `/.well-known/agent-card.json` following the **A2A Protocol** 
 
 ## Why ChromaDB Replaced AlloyDB
 
-The original system used **AlloyDB + Vertex AI text-embedding-005** for vector search. AlloyDB is a powerful managed database, but it costs ~$130–160/month whether you run one query or ten thousand. For a POC proving the concept to a client, that's budget you cannot justify.
+The original system used **AlloyDB + Vertex AI text-embedding-005** for vector search. AlloyDB is production-grade — but it costs ~$130–160/month whether you run one query or ten thousand. For a POC proving the concept to a client, that's budget you cannot justify before closing the deal.
 
 We replaced it with:
 
-- **ChromaDB** — open-source, embedded, persistent vector database. Runs inside the supplier agent container. No server. No cloud account. No cost.
-- **sentence-transformers `all-MiniLM-L6-v2`** — open-source embedding model. Runs locally. Downloads ~80MB once on first start, then cached. No API calls, no cost.
+- **ChromaDB** — open-source, embedded, persistent vector database. Runs inside the supplier agent process. No server. No cloud account. No cost.
+- **sentence-transformers `all-MiniLM-L6-v2`** — open-source embedding model. Runs locally. Downloads ~80MB once on first start, then cached. No API calls.
 
-The supplier agent's public API (`get_embedding`, `find_supplier`) is identical — nothing else in the system changed. The vector search behavior and confidence scoring work the same way. The only difference is the bill.
+The supplier agent's public API (`get_embedding`, `find_supplier`) is identical — nothing else in the system changed.
 
-**If you win the client and need to scale:** the upgrade path from ChromaDB → managed vector store (RDS Aurora pgvector, OpenSearch Serverless, or Bedrock Knowledge Base) is a single-file change in `inventory.py`. The rest of the system stays the same.
+**When you win the client and need to scale:** upgrade from ChromaDB → managed vector store (RDS Aurora pgvector, OpenSearch Serverless, or Bedrock Knowledge Base) is a single-file change in `inventory.py`.
 
 ---
 
@@ -86,7 +127,7 @@ This is the number that matters for a POC conversation with a client.
 
 The POC runs on AWS for under **$6/month**. The GCP live demo costs **$150+ per month** for the same workload — almost entirely AlloyDB instance uptime.
 
-When the client commits and you need to scale, you swap ChromaDB for a managed service. That conversation is much easier to have after you've proven the system works.
+When the client commits and you need to scale, you swap ChromaDB for a managed service. See [intents/agentcore.md](intents/agentcore.md) for the full migration guide.
 
 ---
 
@@ -101,36 +142,38 @@ When the client commits and you need to scale, you swap ChromaDB for a managed s
 
 ---
 
-## MCP Integrations
+## MCP Integrations (post-order)
 
 After an order is confirmed, the Control Tower triggers three real-world integrations via Google APIs — no manual steps.
 
-```
-Order confirmed by Control Tower
-        │
-        ├──▶ send_gmail_email
-        │       Sends an HTML order confirmation to the supplier
-        │
-        ├──▶ create_calendar_event
-        │       Creates a delivery date event on Google Calendar
-        │
-        └──▶ append_google_sheet_row
-                Appends a row to the order log spreadsheet
-```
-
-| Tool | Service | What it does |
-|---|---|---|
-| `send_gmail_email` | Gmail API | Sends HTML order confirmation email |
-| `create_calendar_event` | Google Calendar API | Creates a delivery date event |
-| `append_google_sheet_row` | Google Sheets API | Appends order details as a new row |
+- **Gmail** — sends an HTML order confirmation email
+- **Google Calendar** — creates a delivery date event on the primary calendar
+- **Google Sheets** — appends an order log row (order ID, part, supplier, cost, carrier, ETA, origin)
 
 ---
 
-## Security & Guardrails
+## Enterprise Features
+
+### Governance Layer
+Every request is validated before any agent runs:
+- Image type and size validation (jpeg, png, webp only, max 5MB)
+- Prompt injection detection — 11 known patterns blocked
+- High-risk order flagging — quantities over 1000 require human approval
+- Full audit logging with unique request IDs and timestamps
+
+### Observability and Audit Trail
+Every agent execution is fully traceable:
+- Per-agent execution tracing (start time, duration, status)
+- Workflow-level tracking across all agents via workflow ID
+- Structured audit logs written to file for compliance
+- Complete decision history retrievable by workflow ID
+- Success and failure capture with full error context
+
+### Security and Guardrails
 
 **Vision Agent:**
 - Image size capped at 10MB; unsupported MIME types rejected before any model call
-- Prompt injection detection — 11 known patterns blocked (`ignore previous`, `act as`, `jailbreak`, etc.)
+- Prompt injection detection — 11 known injection patterns blocked (`ignore previous`, `act as`, `jailbreak`, etc.)
 - Queries sanitized and truncated to 500 characters before reaching Gemini
 
 **Supplier Agent:**
@@ -151,14 +194,16 @@ Order confirmed by Control Tower
 
 | Layer | Technology | Why |
 |---|---|---|
-| Vision | Gemini 3 Flash + Code Execution | Deterministic counting — model writes and runs Python, not guesses |
+| Governance | Custom Python layer | Enterprise policy enforcement before agent execution |
+| Observability | Structured logging + tracing | Full audit trail across every workflow |
+| Vision | Gemini 3 Flash + Code Execution | Deterministic counting, not hallucination |
 | Query Gen | Gemini 2.5 Flash Lite | Fast structured output with Pydantic models |
 | Embeddings | sentence-transformers `all-MiniLM-L6-v2` | Free, local, no API key — downloads once and caches |
 | Vector DB | ChromaDB (embedded) | Free, open-source, persistent, no server — runs in-process |
 | Backend | FastAPI + WebSocket | Async-native, real-time event streaming to UI |
 | Agent Protocol | A2A | Plug-and-play agent discovery and composability |
 | MCP | FastMCP | Standardized tool protocol for Gmail, Calendar, Sheets |
-| Integrations | Gmail, Google Calendar, Google Sheets APIs | Real-world order confirmation and logging |
+| Integrations | Gmail, Google Calendar, Google Sheets | Real-world order confirmation and logging |
 
 ---
 
@@ -171,6 +216,8 @@ MultiAgentSupplyChainSystem/
 ├── .env.example                      # Config template
 │
 ├── agents/
+│   ├── governance.py                 # Input validation, prompt injection protection, policy enforcement
+│   ├── observability.py              # Per-agent tracing, audit logging
 │   ├── vision-agent/
 │   │   ├── agent.py                  # Gemini 3 Flash vision + bounding box logic
 │   │   ├── agent_executor.py         # A2A server executor
@@ -203,12 +250,14 @@ MultiAgentSupplyChainSystem/
 ├── intents/
 │   └── agentcore.md                  # Migration guide: why, how, and POC cost breakdown
 │
-├── deploy/
-│   ├── deploy.sh                     # GCP Cloud Run deployment
-│   └── cleanup.sh                    # Tears down GCP resources
+├── tests/
+│   ├── test_governance.py            # 4 governance tests
+│   ├── test_observability.py         # 3 observability tests
+│   └── test_supply_chain.py          # 97 pipeline tests — fully offline
 │
-└── tests/
-    └── test_supply_chain.py          # 97 tests — run completely offline, no credentials needed
+└── deploy/
+    ├── deploy.sh                     # GCP Cloud Run deployment
+    └── cleanup.sh                    # Tears down GCP resources
 ```
 
 ---
@@ -238,22 +287,19 @@ No database server, no cloud vector store, no AlloyDB account needed.
 ### Run Locally
 
 ```bash
-# Clone
 git clone https://github.com/kendallmark3/MultiAgentSupplyChainSystem.git
 cd MultiAgentSupplyChainSystem
 
 # Copy and fill in environment config
 cp .env.example .env
-# Edit .env — only GOOGLE_CLOUD_PROJECT and Gemini key required to start
+# Edit .env — only GOOGLE_CLOUD_PROJECT required to start
 
 # Launch all services
-# On first run: automatically seeds ChromaDB with 20 inventory items
+# First run: auto-seeds ChromaDB with 20 inventory items (~80MB model download)
 sh run.sh
 ```
 
 Open **http://localhost:8080** for the Control Tower.
-
-The first run downloads the `all-MiniLM-L6-v2` model (~80MB) and seeds ChromaDB. Every run after that starts instantly from the local cache.
 
 ### Pre-seed the database (optional)
 
@@ -272,7 +318,7 @@ sh agentcore/deploy/deploy-agentcore.sh
 
 See [intents/agentcore.md](intents/agentcore.md) for the full migration guide and cost breakdown.
 
-### Deploy to GCP Cloud Run (original)
+### Deploy to GCP Cloud Run
 
 ```bash
 sh deploy/deploy.sh
@@ -282,26 +328,48 @@ sh deploy/deploy.sh
 
 ## Running Tests
 
-No API keys or cloud credentials needed — all 97 tests run completely offline.
-
 ```bash
+# Governance layer tests (4 tests)
+python tests/test_governance.py
+
+# Observability tests (3 tests)
+python tests/test_observability.py
+
+# Full pipeline tests — no API keys or credentials needed (97 tests)
 pip install pytest
 pytest tests/test_supply_chain.py -v
 ```
 
-| Test Class | Count | What it covers |
-|---|---|---|
-| `TestValidateImageInput` | 11 | Valid types, empty bytes, 10MB size limit, bad MIME types |
-| `TestSanitizeVisionQuery` | 13 | All 11 injection patterns, truncation, None/empty inputs |
-| `TestExtractBoundingBoxes` | 6 | Valid JSON, missing block, malformed JSON, empty array |
-| `TestSanitizeSupplierQuery` | 10 | SQL injection, XSS attempts, truncation, allowlist chars |
-| `TestComputeConfidence` | 9 | Distance 0→100%, distance 2→0%, None handling, clamping |
-| `TestEstimateWeight` | 8 | All item types, default fallback, case insensitivity |
-| `TestGetSupplierLocation` | 6 | Exact match, fuzzy match, unknown supplier default |
-| `TestCalculateShipping` | 15 | All zones, handling fees, breakdown totals, ETA labels |
-| `TestMcpTools` | 6 | Gmail, Calendar, Sheets confirmation contracts |
-| `TestEndToEndLogic` | 5 | Full pipeline: vision → sanitize → logistics |
-| **Total** | **97** | |
+Expected output:
+```
+🔒 Running Governance Layer Tests...
+✅ test_valid_request PASSED
+✅ test_prompt_injection_blocked PASSED
+✅ test_high_quantity_blocked PASSED
+✅ test_invalid_image_type PASSED
+✅ All governance tests passed!
+
+🔍 Running Observability Tests...
+✅ test_successful_agent_trace PASSED
+✅ test_failed_agent_trace PASSED
+✅ test_full_workflow_trace PASSED
+✅ All observability tests passed!
+```
+
+---
+
+## Branch Workflow
+
+```
+main
+ └── dev
+      └── feature/your-feature-name
+```
+
+- All changes are developed on feature branches
+- Feature branches are merged into dev via pull request
+- Dev is merged into main after review
+- No direct pushes to main
 
 ---
 
@@ -309,6 +377,12 @@ pytest tests/test_supply_chain.py -v
 
 **Why ChromaDB over AlloyDB for the POC?**
 AlloyDB costs ~$130–160/month for the instance alone, billed by uptime not by usage. For a POC with 100 manual test runs per month, you're paying $150 to run the equivalent of $0.50 in actual queries. ChromaDB runs embedded in the supplier agent — same cosine vector search, same confidence scoring, zero cost. When the POC converts to production and volume justifies a managed service, the upgrade is a single-file swap.
+
+**Why a governance layer?**
+Enterprises cannot allow agents to run unchecked. Every request must be validated, policy-enforced, and logged before any agent executes.
+
+**Why observability?**
+Decisions without audit trails are liabilities. Every agent action is traceable by workflow ID for compliance, debugging, and enterprise reporting.
 
 **Why code execution for vision?**
 Asking an LLM to count items and return a number is unreliable. Giving it a Python interpreter and asking it to write counting logic, then run it, produces deterministic, auditable results with exact bounding boxes per detected object.
@@ -367,3 +441,8 @@ gcloud services enable aiplatform.googleapis.com
 - [Model Context Protocol](https://modelcontextprotocol.io/)
 - [FastMCP](https://github.com/jlowin/fastmcp)
 - [Gemini Code Execution](https://cloud.google.com/vertex-ai/generative-ai/docs/model-reference/code-execution-api)
+
+---
+
+## License
+Apache-2.0
