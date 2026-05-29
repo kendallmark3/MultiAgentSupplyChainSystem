@@ -116,18 +116,39 @@ $(cat "$OUTPUT_FILE")
 \`\`\`
 MDEOF
 
-# ── Symlink latest ────────────────────────────────────────────
+# ── Copy to latest ───────────────────────────────────────────
 cp "$REPORT_HTML" "$LATEST_HTML"
 cp "$REPORT_MD"   "$LATEST_MD"
 rm -f "$OUTPUT_FILE"
+
+# ── Serve report on port 9090 ────────────────────────────────
+REPORT_PORT=9090
+# Kill any existing report server on that port
+lsof -ti:$REPORT_PORT | xargs kill -9 2>/dev/null || true
+sleep 0.5
+
+python3 -m http.server $REPORT_PORT \
+    --directory "$REPORTS_DIR" \
+    > /dev/null 2>&1 &
+REPORT_SERVER_PID=$!
+
+sleep 0.5
+
+# Open browser to the latest report
+if command -v open >/dev/null 2>&1; then
+    open "http://localhost:$REPORT_PORT/latest.html"
+elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "http://localhost:$REPORT_PORT/latest.html"
+fi
 
 # ── Summary ──────────────────────────────────────────────────
 echo ""
 echo "════════════════════════════════════════════════════"
 echo "  $STATUS_BADGE   $PASSED passed  |  $FAILED failed  |  $SKIPPED skipped  |  $TOTAL total"
-echo "  HTML : tests/reports/report_${TIMESTAMP}.html"
-echo "  MD   : tests/reports/report_${TIMESTAMP}.md"
-echo "  Also : tests/reports/latest.html  (always current)"
+echo "  Report : http://localhost:$REPORT_PORT/latest.html"
+echo "  Saved  : tests/reports/report_${TIMESTAMP}.html"
+echo "           tests/reports/report_${TIMESTAMP}.md"
+echo "  Server : PID $REPORT_SERVER_PID (port $REPORT_PORT)"
 echo "════════════════════════════════════════════════════"
 echo ""
 
