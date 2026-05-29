@@ -693,13 +693,9 @@ async def run_workflow_with_events(image_bytes: bytes):
             )
 
 
-# ── MCP Integration ──────────────────────────────────────────────────────────
+# ── Email Integration ─────────────────────────────────────────────────────────
 MCP_USER_EMAIL = os.environ.get("MCP_USER_EMAIL", "")
-SHEETS_URL = os.environ.get("GOOGLE_SHEETS_URL", "")
-SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
-OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
-OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
-OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
+GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 USER_EMAIL = os.environ.get("MCP_USER_EMAIL", "")
 
 
@@ -707,104 +703,49 @@ async def run_mcp_integrations(
     order_id, part_name, supplier_name, item_count,
     item_type, shipping_cost, carrier, eta, origin, manager
 ):
-    import asyncio, base64, pytz
-    from datetime import datetime, timedelta
+    import asyncio, smtplib, pytz
+    from datetime import datetime
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
-    from google.oauth2.credentials import Credentials
-    from google.auth.transport.requests import Request
 
     results = {"email": False, "calendar": False, "sheets": False}
     loop = asyncio.get_event_loop()
 
-    def get_creds():
-        c = Credentials(
-            token=None,
-            refresh_token=OAUTH_REFRESH_TOKEN,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=OAUTH_CLIENT_ID,
-            client_secret=OAUTH_CLIENT_SECRET,
-            scopes=["https://www.googleapis.com/auth/gmail.send",
-                    "https://www.googleapis.com/auth/calendar",
-                    "https://www.googleapis.com/auth/spreadsheets"]
-        )
-        c.refresh(Request())
-        return c
-
     def do_all():
-        creds = get_creds()
         tz = pytz.timezone("America/Chicago")
         now = datetime.now(tz)
-        now_str = now.strftime("%Y-%m-%d %H:%M")
         r = {"email": False, "calendar": False, "sheets": False}
 
-        # Gmail
-        try:
-            svc = build("gmail", "v1", credentials=creds)
-            html = f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
-            <div style="background:#6366f1;padding:20px;border-radius:10px 10px 0 0">
-            <h1 style="color:white;margin:0">Order {order_id} Confirmed</h1></div>
-            <div style="background:#f8fafc;padding:24px;border:1px solid #e2e8f0;border-radius:0 0 10px 10px">
-            <table style="width:100%;border-collapse:collapse">
-            <tr><td style="padding:8px;color:#6b7280">Part</td><td style="padding:8px;font-weight:600">{part_name}</td></tr>
-            <tr style="background:#f1f5f9"><td style="padding:8px;color:#6b7280">Supplier</td><td style="padding:8px">{supplier_name}</td></tr>
-            <tr><td style="padding:8px;color:#6b7280">Quantity</td><td style="padding:8px">{item_count}</td></tr>
-            <tr style="background:#f1f5f9"><td style="padding:8px;color:#6b7280">Shipping</td><td style="padding:8px;color:#16a34a;font-weight:700">{shipping_cost} via {carrier}</td></tr>
-            <tr><td style="padding:8px;color:#6b7280">ETA</td><td style="padding:8px">{eta}</td></tr>
-            <tr style="background:#f1f5f9"><td style="padding:8px;color:#6b7280">From</td><td style="padding:8px">{origin} → New York, NY</td></tr>
-            </table></div></div>"""
-            msg = MIMEMultipart("alternative")
-            msg["Subject"] = f"Order {order_id} Confirmed — {part_name}"
-            msg["From"] = USER_EMAIL
-            msg["To"] = USER_EMAIL
-            msg.attach(MIMEText(html, "html"))
-            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-            svc.users().messages().send(userId="me", body={"raw": raw}).execute()
-            r["email"] = True
-            logger.info(f"✅ Gmail sent!")
-        except Exception as e:
-            logger.error(f"Gmail error: {e}")
-
-        # Calendar
-        try:
-            svc = build("calendar", "v3", credentials=creds)
-            try: days = int(str(eta).split()[0])
-            except: days = 3
-            delivery = now + timedelta(days=days)
-            start_dt = delivery.replace(hour=9, minute=0, second=0, microsecond=0)
-            end_dt = delivery.replace(hour=10, minute=0, second=0, microsecond=0)
-            event = {
-                "summary": f"Delivery: {part_name} ({order_id})",
-                "description": f"Order from {supplier_name} via {carrier}. Cost: {shipping_cost}",
-                "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Chicago"},
-                "end": {"dateTime": end_dt.isoformat(), "timeZone": "America/Chicago"},
-            }
-            svc.events().insert(calendarId="primary", body=event).execute()
-            r["calendar"] = True
-            logger.info(f"✅ Calendar event created!")
-        except Exception as e:
-            logger.error(f"Calendar error: {e}")
-
-        # Sheets
-        try:
-            svc = build("sheets", "v4", credentials=creds)
-            sheet = svc.spreadsheets()
-            res = sheet.values().get(spreadsheetId=SHEET_ID, range="Sheet1!A1:A1").execute()
-            if not res.get("values"):
-                sheet.values().update(
-                    spreadsheetId=SHEET_ID, range="Sheet1!A1",
-                    valueInputOption="RAW",
-                    body={"values": [["Order ID", "Date", "Part", "Supplier", "Quantity", "Shipping Cost", "Carrier", "ETA", "Origin"]]}
-                ).execute()
-            sheet.values().append(
-                spreadsheetId=SHEET_ID, range="Sheet1!A:I",
-                valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-                body={"values": [[order_id, now_str, part_name, supplier_name, str(item_count), shipping_cost, carrier, str(eta), origin]]}
-            ).execute()
-            r["sheets"] = True
-            logger.info(f"✅ Sheets logged!")
-        except Exception as e:
-            logger.error(f"Sheets error: {e}")
+        # Gmail via SMTP App Password
+        if USER_EMAIL and GMAIL_APP_PASSWORD:
+            try:
+                html = f"""<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+                <div style="background:#6366f1;padding:20px;border-radius:10px 10px 0 0">
+                <h1 style="color:white;margin:0">Order {order_id} Confirmed</h1></div>
+                <div style="background:#f8fafc;padding:24px;border:1px solid #e2e8f0;border-radius:0 0 10px 10px">
+                <table style="width:100%;border-collapse:collapse">
+                <tr><td style="padding:8px;color:#6b7280">Part</td><td style="padding:8px;font-weight:600">{part_name}</td></tr>
+                <tr style="background:#f1f5f9"><td style="padding:8px;color:#6b7280">Supplier</td><td style="padding:8px">{supplier_name}</td></tr>
+                <tr><td style="padding:8px;color:#6b7280">Quantity</td><td style="padding:8px">{item_count}</td></tr>
+                <tr style="background:#f1f5f9"><td style="padding:8px;color:#6b7280">Shipping</td><td style="padding:8px;color:#16a34a;font-weight:700">{shipping_cost} via {carrier}</td></tr>
+                <tr><td style="padding:8px;color:#6b7280">ETA</td><td style="padding:8px">{eta}</td></tr>
+                <tr style="background:#f1f5f9"><td style="padding:8px;color:#6b7280">From</td><td style="padding:8px">{origin} → New York, NY</td></tr>
+                </table></div></div>"""
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = f"Order {order_id} Confirmed — {part_name}"
+                msg["From"] = USER_EMAIL
+                msg["To"] = USER_EMAIL
+                msg.attach(MIMEText(html, "html"))
+                with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                    server.starttls()
+                    server.login(USER_EMAIL, GMAIL_APP_PASSWORD)
+                    server.sendmail(USER_EMAIL, USER_EMAIL, msg.as_string())
+                r["email"] = True
+                logger.info("Gmail sent via SMTP!")
+            except Exception as e:
+                logger.error(f"Gmail SMTP error: {e}")
+        else:
+            logger.warning("Gmail skipped — GMAIL_APP_PASSWORD not set in .env")
 
         return r
 

@@ -28,24 +28,13 @@ fi
 # Validate Prerequisites
 # ============================================================================
 
-# Vertex AI config for Vision Agent
-if [ -z "$GOOGLE_CLOUD_PROJECT" ]; then
-    PROJECT=$(gcloud config get-value project 2>/dev/null)
-    if [ -z "$PROJECT" ]; then
-        echo "❌ GOOGLE_CLOUD_PROJECT not set"
-        echo "   Run: gcloud config set project YOUR_PROJECT_ID"
-        exit 1
-    fi
-    export GOOGLE_CLOUD_PROJECT="$PROJECT"
+# Vision Agent uses Anthropic API
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+    echo "❌ ANTHROPIC_API_KEY not set in .env"
+    exit 1
 fi
 
-if [ -z "$GOOGLE_CLOUD_LOCATION" ]; then
-    export GOOGLE_CLOUD_LOCATION="global"
-fi
-
-export GOOGLE_GENAI_USE_VERTEXAI="True"
-
-echo "✅ Vertex AI configured for Vision Agent"
+echo "✅ Anthropic API configured for Vision Agent"
 
 # ChromaDB — local vector store, no server or credentials needed
 CHROMA_DB_PATH="${CHROMA_DB_PATH:-$SCRIPT_DIR/database/chroma_db}"
@@ -189,7 +178,7 @@ fi
 cd "$SCRIPT_DIR"
 echo ""
 
-# ── Challenge 3: Start Logistics Agent ──────────────────────────────────────
+# ── Start Logistics Agent ───────────────────────────────────────────────────
 echo "🚚 Starting Logistics Agent on port 8083..."
 
 cd "$SCRIPT_DIR/agents/logistics-agent"

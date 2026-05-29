@@ -1,5 +1,5 @@
 a2a-sdk[http-server]==0.3.2
-google-genai
+anthropic>=0.40.0
 uvicorn
 Pillow
 pydantic
