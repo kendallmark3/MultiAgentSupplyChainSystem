@@ -39,6 +39,16 @@ temp/
 *.iam.gserviceaccount.com.json
 4e5f00e9-*.json
 
+# ChromaDB local vector store
+database/chroma_db/
+
+# Governance and observability audit logs
+*.log
+governance_audit.log
+
+# AWS environment config (contains credentials)
+.env.aws
+
 # Test artifacts
 test_shared_alloydb.py
 test_shared_alloydb.env
