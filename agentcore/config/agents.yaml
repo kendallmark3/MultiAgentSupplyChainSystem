@@ -1,0 +1,128 @@
+# AgentCore agent and tool definitions
+# Used by deploy-agentcore.sh to register all agents in AgentCore Gateway
+
+agents:
+  vision-agent:
+    name: Vision Agent
+    description: Counts items in warehouse shelf images using Claude 3.5 Sonnet and AgentCore Code Interpreter
+    runtime:
+      handler: agentcore/agents/vision-agent/agentcore_handler.py
+      python_version: "3.11"
+      memory_mb: 1024
+      timeout_seconds: 120
+    model: anthropic.claude-3-5-sonnet-20241022-v2:0
+    capabilities:
+      code_interpreter: true
+      streaming: false
+    local_port: 8081
+    health_path: /health
+    input_modes:
+      - application/json
+    output_modes:
+      - application/json
+    skills:
+      - id: count-warehouse-items
+        name: Count Warehouse Items
+        description: Analyzes a base64-encoded warehouse shelf image and returns item count, bounding boxes, and a supplier search query
+        tags:
+          - vision
+          - inventory
+          - counting
+        examples:
+          - Count the boxes on this warehouse shelf
+
+  supplier-agent:
+    name: Supplier Agent
+    description: Finds best-matched supplier parts via Bedrock Knowledge Base semantic search
+    runtime:
+      handler: agentcore/agents/supplier-agent/agentcore_handler.py
+      python_version: "3.11"
+      memory_mb: 512
+      timeout_seconds: 30
+    capabilities:
+      knowledge_base: true
+      streaming: false
+    local_port: 8082
+    health_path: /health
+    input_modes:
+      - application/json
+    output_modes:
+      - application/json
+    skills:
+      - id: find-supplier-part
+        name: Find Supplier Part
+        description: Searches Bedrock Knowledge Base with Titan Embeddings v2 to find the best-matched part and supplier
+        tags:
+          - supplier
+          - vector-search
+          - inventory
+
+  logistics-agent:
+    name: Logistics Agent
+    description: Calculates shipping cost, carrier, and ETA based on supplier location and destination
+    runtime:
+      handler: agentcore/agents/logistics-agent/agentcore_handler.py
+      python_version: "3.11"
+      memory_mb: 256
+      timeout_seconds: 10
+    capabilities:
+      streaming: false
+    local_port: 8083
+    health_path: /health
+    input_modes:
+      - application/json
+    output_modes:
+      - application/json
+    skills:
+      - id: calculate-shipping
+        name: Calculate Shipping
+        description: Calculates zone-based shipping cost, carrier selection (FedEx/UPS), and ETA
+        tags:
+          - logistics
+          - shipping
+
+  control-tower:
+    name: Control Tower
+    description: Supervisor agent that orchestrates Vision, Supplier, and Logistics agents via AgentCore Gateway and streams results via WebSocket
+    runtime:
+      handler: agentcore/agents/control-tower/agentcore_handler.py
+      python_version: "3.11"
+      memory_mb: 1024
+      timeout_seconds: 300
+    capabilities:
+      supervisor: true
+      streaming: true
+    local_port: 8080
+    health_path: /api/health
+    supervised_agents:
+      - vision-agent
+      - supplier-agent
+      - logistics-agent
+    input_modes:
+      - multipart/form-data
+      - application/json
+    output_modes:
+      - application/json
+      - text/event-stream
+
+tools:
+  gmail-tool:
+    name: Send Gmail Email
+    description: Sends an HTML order confirmation email via Gmail API
+    type: mcp
+    function: send_order_email
+    source: agentcore/tools/gmail_tool.py
+
+  calendar-tool:
+    name: Create Calendar Event
+    description: Creates a Google Calendar delivery date event
+    type: mcp
+    function: create_delivery_event
+    source: agentcore/tools/calendar_tool.py
+
+  sheets-tool:
+    name: Append Sheets Row
+    description: Appends an order row to the Google Sheets order log
+    type: mcp
+    function: append_order_row
+    source: agentcore/tools/sheets_tool.py

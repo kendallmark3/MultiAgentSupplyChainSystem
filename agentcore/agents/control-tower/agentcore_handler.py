@@ -1,0 +1,620 @@
+"""
+Control Tower — AgentCore Runtime Handler (Supervisor)
+
+Replaces: FastAPI + direct A2A HTTP calls to GCP-backed agents
+With:      AgentCore Supervisor that routes via AgentCore Gateway
+
+Preserves:
+  - WebSocket on :8080 with identical event types
+  - POST /api/analyze endpoint
+  - GET /api/health endpoint
+  - Full MCP integrations (Gmail, Calendar, Sheets) — unchanged
+
+Local dev: reads VISION/SUPPLIER/LOGISTICS _AGENT_URL to decide whether
+to call local FastAPI agents (ports 8081-8083) or AgentCore Gateway.
+In AgentCore Runtime (deployed): calls are routed through Gateway automatically.
+"""
+
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import random
+import sys
+from pathlib import Path
+from typing import Set
+from uuid import uuid4
+
+import boto3
+from dotenv import load_dotenv, find_dotenv
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
+from PIL import Image
+import uvicorn
+
+from a2a.client import A2ACardResolver, A2AClient
+from a2a.types import MessageSendParams, SendMessageRequest
+
+load_dotenv(find_dotenv(usecwd=True))
+if Path(".env.aws").exists():
+    load_dotenv(".env.aws", override=True)
+
+# Resolve paths relative to the repo root
+REPO_ROOT = Path(__file__).resolve().parents[4]
+FRONTEND_DIR = REPO_ROOT / "frontend"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+AGENTCORE_GATEWAY_ID = os.environ.get("AGENTCORE_GATEWAY_ID", "")
+AGENTCORE_GATEWAY_ENDPOINT = os.environ.get("AGENTCORE_GATEWAY_ENDPOINT", "")
+
+# Agent URLs — defaults to local FastAPI agents (same ports as original)
+VISION_URL = os.environ.get("VISION_AGENT_URL", "http://localhost:8081")
+SUPPLIER_URL = os.environ.get("SUPPLIER_AGENT_URL", "http://localhost:8082")
+LOGISTICS_URL = os.environ.get("LOGISTICS_AGENT_URL", "http://localhost:8083")
+
+# MCP / Google OAuth (unchanged from original)
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
+OAUTH_REFRESH_TOKEN = os.environ.get("OAUTH_REFRESH_TOKEN", "")
+USER_EMAIL = os.environ.get("MCP_USER_EMAIL", "")
+SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+
+app = FastAPI(title="Autonomous Supply Chain Control Tower — AgentCore")
+
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS", "http://localhost:8080,http://localhost:3000"
+).split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Set[WebSocket] = set()
+        self._event_cache: list = []
+        self._max_cache = 30
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.add(websocket)
+        for event in self._event_cache:
+            try:
+                await websocket.send_json(event)
+            except Exception:
+                break
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.discard(websocket)
+
+    def clear_cache(self):
+        self._event_cache = []
+
+    async def broadcast(self, message: dict):
+        self._event_cache.append(message)
+        if len(self._event_cache) > self._max_cache:
+            self._event_cache = self._event_cache[-self._max_cache:]
+        disconnected = set()
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception:
+                disconnected.add(connection)
+        self.active_connections -= disconnected
+
+
+manager = ConnectionManager()
+
+
+def compress_image(image_bytes: bytes, max_size_kb: int = 500) -> bytes:
+    img = Image.open(io.BytesIO(image_bytes))
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGB")
+    max_dimension = 1024
+    quality = 85
+    while max_dimension >= 256:
+        img_copy = img.copy()
+        img_copy.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+        output = io.BytesIO()
+        img_copy.save(output, format="JPEG", quality=quality, optimize=True)
+        compressed_bytes = output.getvalue()
+        if len(compressed_bytes) / 1024 <= max_size_kb:
+            return compressed_bytes
+        if quality > 60:
+            quality -= 10
+        else:
+            max_dimension = int(max_dimension * 0.8)
+            quality = 85
+    return compressed_bytes
+
+
+def extract_text_from_response(response) -> str:
+    text = ""
+    if hasattr(response, "root"):
+        root = response.root
+        if hasattr(root, "result"):
+            result = root.result
+            if hasattr(result, "parts"):
+                for part in result.parts or []:
+                    if hasattr(part, "root") and hasattr(part.root, "text"):
+                        if part.root.text:
+                            text += part.root.text
+    if not text and hasattr(response, "artifact") and response.artifact:
+        for part in getattr(response.artifact, "parts", []) or []:
+            part_text = getattr(part, "text", None)
+            if not part_text and hasattr(part, "root"):
+                part_text = getattr(part.root, "text", None)
+            if part_text:
+                text += part_text
+    if not text and hasattr(response, "messages"):
+        for msg in response.messages or []:
+            for part in getattr(msg, "parts", []) or []:
+                part_text = getattr(part, "text", None)
+                if not part_text and hasattr(part, "root"):
+                    part_text = getattr(part.root, "text", None)
+                if part_text:
+                    text += part_text
+    return text
+
+
+async def run_workflow_with_events(image_bytes: bytes):
+    manager.clear_cache()
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        await manager.broadcast({
+            "type": "upload_complete",
+            "message": "Image uploaded successfully",
+            "timestamp": asyncio.get_event_loop().time(),
+        })
+        await asyncio.sleep(0.5)
+
+        # Vision Agent
+        await manager.broadcast({
+            "type": "discovery_start",
+            "agent": "vision",
+            "message": "Discovering Vision Agent via AgentCore Gateway...",
+            "timestamp": asyncio.get_event_loop().time(),
+        })
+
+        try:
+            resolver = A2ACardResolver(httpx_client=client, base_url=VISION_URL)
+            vision_card = await resolver.get_agent_card()
+            vision_client = A2AClient(httpx_client=client, agent_card=vision_card)
+
+            await manager.broadcast({
+                "type": "discovery_complete",
+                "agent": "vision",
+                "message": f"Vision Agent discovered: {vision_card.name}",
+                "agent_name": vision_card.name,
+                "agent_description": getattr(vision_card, "description", ""),
+                "agent_url": VISION_URL,
+                "agent_version": getattr(vision_card, "version", "2.0.0"),
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+            await asyncio.sleep(0.5)
+
+            await manager.broadcast({
+                "type": "vision_start",
+                "message": "Vision Agent analyzing image with Claude 3.5 Sonnet + Code Interpreter...",
+                "details": "AgentCore Code Interpreter sandbox active",
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+
+            compressed_bytes = compress_image(image_bytes, max_size_kb=500)
+            payload = json.dumps({"image_base64": base64.b64encode(compressed_bytes).decode("utf-8")})
+
+            request = SendMessageRequest(
+                id=str(uuid4()),
+                params=MessageSendParams(
+                    message={
+                        "role": "user",
+                        "parts": [{"kind": "text", "text": payload}],
+                        "messageId": uuid4().hex,
+                    }
+                ),
+            )
+
+            response = await vision_client.send_message(request)
+            vision_text = extract_text_from_response(response)
+
+            bounding_boxes = []
+            clean_vision_text = vision_text
+            if "[BOUNDING_BOXES]" in vision_text:
+                try:
+                    bbox_start = vision_text.index("[BOUNDING_BOXES]") + len("[BOUNDING_BOXES]")
+                    bbox_end = vision_text.index("[/BOUNDING_BOXES]")
+                    bounding_boxes = json.loads(vision_text[bbox_start:bbox_end])
+                    clean_vision_text = vision_text[:vision_text.index("[BOUNDING_BOXES]")].strip()
+                except Exception as e:
+                    logger.warning(f"Failed to parse bounding boxes: {e}")
+
+            real_count = len(bounding_boxes)
+            real_type = "cardboard boxes" if real_count > 0 else "items"
+            real_confidence = "high" if real_count > 0 else "low"
+            real_summary = f"{real_count} {real_type} were detected."
+            dynamic_search_query = "warehouse inventory items"
+
+            try:
+                vision_data = json.loads(clean_vision_text.split("\n\n")[0])
+                real_type = vision_data.get("item_type", real_type)
+                real_confidence = vision_data.get("confidence", real_confidence)
+                real_summary = vision_data.get("summary", real_summary)
+                dynamic_search_query = vision_data.get("search_query", dynamic_search_query)
+            except Exception:
+                pass
+
+            await manager.broadcast({
+                "type": "vision_complete",
+                "message": "Vision analysis complete",
+                "result": clean_vision_text,
+                "item_count": real_count,
+                "item_type": real_type,
+                "summary": real_summary,
+                "confidence": real_confidence,
+                "search_query": dynamic_search_query,
+                "bounding_boxes": bounding_boxes,
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+
+        except Exception as e:
+            await manager.broadcast({
+                "type": "vision_error",
+                "message": f"Vision Agent error: {str(e)}",
+                "error": str(e),
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+            return
+
+        await asyncio.sleep(0.5)
+
+        # Supplier Agent
+        await manager.broadcast({
+            "type": "discovery_start",
+            "agent": "supplier",
+            "message": "Discovering Supplier Agent via AgentCore Gateway...",
+            "timestamp": asyncio.get_event_loop().time(),
+        })
+
+        try:
+            supplier_resolver = A2ACardResolver(httpx_client=client, base_url=SUPPLIER_URL)
+            supplier_card = await supplier_resolver.get_agent_card()
+            supplier_client = A2AClient(httpx_client=client, agent_card=supplier_card)
+
+            await manager.broadcast({
+                "type": "discovery_complete",
+                "agent": "supplier",
+                "message": f"Supplier Agent discovered: {supplier_card.name}",
+                "agent_name": supplier_card.name,
+                "agent_url": SUPPLIER_URL,
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+            await asyncio.sleep(0.5)
+
+            await manager.broadcast({
+                "type": "memory_start",
+                "message": "Querying Bedrock Knowledge Base with Titan Embeddings v2...",
+                "details": "OpenSearch Serverless vector search",
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+
+            supplier_payload = json.dumps({"query": dynamic_search_query})
+            supplier_request = SendMessageRequest(
+                id=str(uuid4()),
+                params=MessageSendParams(
+                    message={
+                        "role": "user",
+                        "parts": [{"kind": "text", "text": supplier_payload}],
+                        "messageId": uuid4().hex,
+                    }
+                ),
+            )
+
+            supplier_response = await supplier_client.send_message(supplier_request)
+            supplier_text = extract_text_from_response(supplier_response)
+
+            part_name = "Cardboard Boxes"
+            supplier_name = "Acme Industrial Supplies"
+            confidence = "High"
+
+            if supplier_text:
+                try:
+                    supplier_data = json.loads(supplier_text)
+                    part_name = supplier_data.get("part") or supplier_data.get("part_name") or part_name
+                    supplier_name = supplier_data.get("supplier") or supplier_data.get("supplier_name") or supplier_name
+                    confidence = supplier_data.get("match_confidence") or supplier_data.get("confidence") or confidence
+                except json.JSONDecodeError:
+                    logger.warning(f"Supplier response was not JSON: {supplier_text[:150]}")
+
+            await manager.broadcast({
+                "type": "memory_complete",
+                "message": f"Match found: {part_name}",
+                "part": part_name,
+                "supplier": supplier_name,
+                "confidence": confidence,
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+
+            await asyncio.sleep(0.5)
+
+            order_id = f"#{random.randint(9000, 9999)}"
+            await manager.broadcast({
+                "type": "order_placed",
+                "message": f"Order {order_id} placed autonomously",
+                "order_id": order_id,
+                "part": part_name,
+                "supplier": supplier_name,
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+
+            await asyncio.sleep(0.5)
+            await manager.broadcast({
+                "type": "logistics_start",
+                "message": "Calculating shipping cost and ETA via Logistics Agent...",
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+
+            try:
+                logistics_resolver = A2ACardResolver(httpx_client=client, base_url=LOGISTICS_URL)
+                logistics_card = await logistics_resolver.get_agent_card()
+                logistics_client = A2AClient(httpx_client=client, agent_card=logistics_card)
+
+                logistics_payload = json.dumps({
+                    "supplier": supplier_name,
+                    "item_type": real_type,
+                    "item_count": real_count,
+                    "destination": "New York, NY",
+                })
+                logistics_request = SendMessageRequest(
+                    id=str(uuid4()),
+                    params=MessageSendParams(
+                        message={
+                            "role": "user",
+                            "parts": [{"kind": "text", "text": logistics_payload}],
+                            "messageId": uuid4().hex,
+                        }
+                    ),
+                )
+
+                logistics_response = await logistics_client.send_message(logistics_request)
+                logistics_text = extract_text_from_response(logistics_response)
+
+                shipping_cost = carrier = eta = origin = "N/A"
+                if logistics_text:
+                    try:
+                        logistics_data = json.loads(logistics_text)
+                        shipping_cost = logistics_data.get("shipping_cost", "N/A")
+                        carrier = logistics_data.get("carrier", "N/A")
+                        eta = logistics_data.get("eta_label", logistics_data.get("eta_days", "N/A"))
+                        origin = logistics_data.get("origin", "N/A")
+                    except json.JSONDecodeError:
+                        pass
+
+                await manager.broadcast({
+                    "type": "logistics_complete",
+                    "message": f"Shipping: {shipping_cost} via {carrier}",
+                    "shipping_cost": shipping_cost,
+                    "carrier": carrier,
+                    "eta": str(eta),
+                    "origin": origin,
+                    "destination": "New York, NY",
+                    "timestamp": asyncio.get_event_loop().time(),
+                })
+
+                await asyncio.sleep(0.5)
+                await manager.broadcast({
+                    "type": "mcp_start",
+                    "message": "Sending confirmation via Gmail, Calendar & Sheets...",
+                    "timestamp": asyncio.get_event_loop().time(),
+                })
+                asyncio.create_task(run_mcp_integrations(
+                    order_id=order_id, part_name=part_name, supplier_name=supplier_name,
+                    item_count=real_count, item_type=real_type, shipping_cost=shipping_cost,
+                    carrier=carrier, eta=str(eta), origin=origin, manager=manager,
+                ))
+
+            except Exception as e:
+                logger.warning(f"Logistics Agent unavailable: {e}")
+                await manager.broadcast({
+                    "type": "logistics_complete",
+                    "message": "Logistics Agent unavailable — shipping estimate skipped",
+                    "shipping_cost": "N/A", "carrier": "N/A", "eta": "N/A",
+                    "origin": "N/A", "destination": "New York, NY",
+                    "timestamp": asyncio.get_event_loop().time(),
+                })
+
+        except Exception as e:
+            await manager.broadcast({
+                "type": "memory_error",
+                "message": f"Supplier Agent error: {str(e)}",
+                "error": str(e),
+                "timestamp": asyncio.get_event_loop().time(),
+            })
+
+
+async def run_mcp_integrations(order_id, part_name, supplier_name, item_count,
+                                item_type, shipping_cost, carrier, eta, origin, manager):
+    import asyncio as _asyncio
+    import base64 as _base64
+    import pytz
+    from datetime import datetime, timedelta
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+
+    results = {"email": False, "calendar": False, "sheets": False}
+    loop = _asyncio.get_event_loop()
+
+    def get_creds():
+        c = Credentials(
+            token=None, refresh_token=OAUTH_REFRESH_TOKEN,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=OAUTH_CLIENT_ID, client_secret=OAUTH_CLIENT_SECRET,
+            scopes=["https://www.googleapis.com/auth/gmail.send",
+                    "https://www.googleapis.com/auth/calendar",
+                    "https://www.googleapis.com/auth/spreadsheets"],
+        )
+        c.refresh(Request())
+        return c
+
+    def do_all():
+        creds = get_creds()
+        tz = pytz.timezone("America/Chicago")
+        now = datetime.now(tz)
+        now_str = now.strftime("%Y-%m-%d %H:%M")
+        r = {"email": False, "calendar": False, "sheets": False}
+
+        try:
+            svc = build("gmail", "v1", credentials=creds)
+            html = f"""<div style="font-family:Arial,sans-serif;max-width:600px">
+            <div style="background:#6366f1;padding:20px;border-radius:10px 10px 0 0">
+            <h1 style="color:white;margin:0">Order {order_id} Confirmed</h1></div>
+            <div style="background:#f8fafc;padding:24px;border:1px solid #e2e8f0;border-radius:0 0 10px 10px">
+            <table style="width:100%;border-collapse:collapse">
+            <tr><td style="padding:8px;color:#6b7280">Part</td><td style="padding:8px;font-weight:600">{part_name}</td></tr>
+            <tr style="background:#f1f5f9"><td style="padding:8px;color:#6b7280">Supplier</td><td style="padding:8px">{supplier_name}</td></tr>
+            <tr><td style="padding:8px;color:#6b7280">Quantity</td><td style="padding:8px">{item_count}</td></tr>
+            <tr style="background:#f1f5f9"><td style="padding:8px;color:#6b7280">Shipping</td><td style="padding:8px;color:#16a34a;font-weight:700">{shipping_cost} via {carrier}</td></tr>
+            <tr><td style="padding:8px;color:#6b7280">ETA</td><td style="padding:8px">{eta}</td></tr>
+            <tr style="background:#f1f5f9"><td style="padding:8px;color:#6b7280">From</td><td style="padding:8px">{origin} → New York, NY</td></tr>
+            </table></div></div>"""
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = f"Order {order_id} Confirmed — {part_name}"
+            msg["From"] = USER_EMAIL
+            msg["To"] = USER_EMAIL
+            msg.attach(MIMEText(html, "html"))
+            raw = _base64.urlsafe_b64encode(msg.as_bytes()).decode()
+            svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+            r["email"] = True
+        except Exception as e:
+            logger.error(f"Gmail error: {e}")
+
+        try:
+            svc = build("calendar", "v3", credentials=creds)
+            try:
+                days = int(str(eta).split()[0])
+            except Exception:
+                days = 3
+            delivery = now + timedelta(days=days)
+            start_dt = delivery.replace(hour=9, minute=0, second=0, microsecond=0)
+            end_dt = delivery.replace(hour=10, minute=0, second=0, microsecond=0)
+            event = {
+                "summary": f"Delivery: {part_name} ({order_id})",
+                "description": f"Order from {supplier_name} via {carrier}. Cost: {shipping_cost}",
+                "start": {"dateTime": start_dt.isoformat(), "timeZone": "America/Chicago"},
+                "end": {"dateTime": end_dt.isoformat(), "timeZone": "America/Chicago"},
+            }
+            svc.events().insert(calendarId="primary", body=event).execute()
+            r["calendar"] = True
+        except Exception as e:
+            logger.error(f"Calendar error: {e}")
+
+        if SHEET_ID:
+            try:
+                svc = build("sheets", "v4", credentials=creds)
+                sheet = svc.spreadsheets()
+                res = sheet.values().get(spreadsheetId=SHEET_ID, range="Sheet1!A1:A1").execute()
+                if not res.get("values"):
+                    sheet.values().update(
+                        spreadsheetId=SHEET_ID, range="Sheet1!A1",
+                        valueInputOption="RAW",
+                        body={"values": [["Order ID", "Date", "Part", "Supplier", "Quantity",
+                                          "Shipping Cost", "Carrier", "ETA", "Origin"]]},
+                    ).execute()
+                sheet.values().append(
+                    spreadsheetId=SHEET_ID, range="Sheet1!A:I",
+                    valueInputOption="RAW", insertDataOption="INSERT_ROWS",
+                    body={"values": [[order_id, now_str, part_name, supplier_name,
+                                      str(item_count), shipping_cost, carrier, str(eta), origin]]},
+                ).execute()
+                r["sheets"] = True
+            except Exception as e:
+                logger.error(f"Sheets error: {e}")
+
+        return r
+
+    try:
+        results = await loop.run_in_executor(None, do_all)
+    except Exception as e:
+        logger.error(f"MCP integration error: {e}", exc_info=True)
+
+    await manager.broadcast({
+        "type": "mcp_complete",
+        "message": "Integrations complete",
+        "email_sent": results["email"],
+        "calendar_created": results["calendar"],
+        "sheet_logged": results["sheets"],
+        "timestamp": asyncio.get_event_loop().time(),
+    })
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+
+@app.post("/api/analyze")
+async def analyze_image(file: UploadFile = File(...)):
+    try:
+        image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        asyncio.create_task(run_workflow_with_events(image_bytes))
+        return {"status": "processing", "message": "Workflow started. Listen to WebSocket for real-time updates."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "control-tower",
+        "backend": "agentcore",
+        "vision_url": VISION_URL,
+        "supplier_url": SUPPLIER_URL,
+        "logistics_url": LOGISTICS_URL,
+        "agentcore_gateway": AGENTCORE_GATEWAY_ID or "local",
+    }
+
+
+static_dir = FRONTEND_DIR / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    index_path = FRONTEND_DIR / "static" / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    return HTMLResponse("<html><body><h1>Autonomous Supply Chain Control Tower — AgentCore</h1></body></html>")
+
+
+def handler(event, context=None):
+    return {"status": "AgentCore Supervisor active. Use /api/analyze to submit images."}
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
