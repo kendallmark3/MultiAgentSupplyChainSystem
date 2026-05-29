@@ -46,32 +46,21 @@ fi
 export GOOGLE_GENAI_USE_VERTEXAI="True"
 
 echo "✅ Vertex AI configured for Vision Agent"
-echo "✅ GCP project configured for Supplier Agent"
 
-# Build ALLOYDB_INSTANCE_URI from component env vars
-if [ -z "$ALLOYDB_INSTANCE_URI" ]; then
-    if [ -n "$ALLOYDB_REGION" ] && [ -n "$ALLOYDB_CLUSTER" ] && [ -n "$ALLOYDB_INSTANCE" ]; then
-        ALLOYDB_URI_PROJECT="${ALLOYDB_PROJECT:-$GOOGLE_CLOUD_PROJECT}"
-        export ALLOYDB_INSTANCE_URI="projects/${ALLOYDB_URI_PROJECT}/locations/${ALLOYDB_REGION}/clusters/${ALLOYDB_CLUSTER}/instances/${ALLOYDB_INSTANCE}"
-    else
-        echo "❌ AlloyDB not configured (required for Supplier Agent)"
-        echo "   Set ALLOYDB_REGION, ALLOYDB_CLUSTER, and ALLOYDB_INSTANCE in .env"
-        echo "   Or run: sh setup.sh"
-        exit 1
-    fi
-fi
-echo "✅ AlloyDB configured: $ALLOYDB_REGION/$ALLOYDB_CLUSTER/$ALLOYDB_INSTANCE"
+# ChromaDB — local vector store, no server or credentials needed
+CHROMA_DB_PATH="${CHROMA_DB_PATH:-$SCRIPT_DIR/database/chroma_db}"
+export CHROMA_DB_PATH
+echo "✅ ChromaDB configured: $CHROMA_DB_PATH"
 
-# Check DB_PASS
-if [ -z "$DB_PASS" ]; then
-    echo "⚠️  DB_PASS not set. Supplier Agent won't be able to connect to database."
-    echo "   Run: export DB_PASS='your-password-from-setup'"
+# Auto-seed ChromaDB on first run if collection is missing
+if [ ! -d "$CHROMA_DB_PATH" ]; then
     echo ""
-    read -p "Continue anyway? (y/N): " -n 1 -r
+    echo "First run: seeding ChromaDB inventory..."
+    cd "$SCRIPT_DIR/database"
+    pip install -q chromadb sentence-transformers python-dotenv
+    python3 seed.py
+    cd "$SCRIPT_DIR"
     echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
 fi
 
 echo "✅ Environment configured"

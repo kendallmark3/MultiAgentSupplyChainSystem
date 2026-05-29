@@ -1,8 +1,6 @@
-google-cloud-alloydb-connector[pg8000]
+chromadb
+sentence-transformers
 python-dotenv
-google-genai
 a2a-sdk[http-server]==0.3.2
 uvicorn
 starlette
-requests
-google-auth

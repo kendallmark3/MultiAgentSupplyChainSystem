@@ -1,296 +1,188 @@
 """
-Supplier Agent: AlloyDB vector search for finding parts and suppliers.
-Uses ScaNN (<=> cosine distance) for high-speed semantic retrieval.
-Connects via AlloyDB Python Connector (no Auth Proxy needed).
+Supplier Agent: ChromaDB vector search for finding parts and suppliers.
+Replaces AlloyDB + Vertex AI text-embedding-005 with fully local, free alternatives:
+  - sentence-transformers (all-MiniLM-L6-v2) for embedding generation
+  - ChromaDB (embedded mode) for persistent cosine vector search
+
+No server required. No cloud credentials needed. Zero cost.
+Data persists to database/chroma_db/ on first seed run.
 """
-import base64
 import json
 import logging
 import os
-import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv, find_dotenv
-import pg8000
-from google.cloud.alloydbconnector import Connector
 
-# Load environment variables from .env file (searches up directory tree)
 load_dotenv(find_dotenv(usecwd=True))
 
-# Configure logging
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+# Repo root is two levels up from agents/supplier-agent/
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+CHROMA_DB_PATH = os.environ.get(
+    "CHROMA_DB_PATH",
+    str(_REPO_ROOT / "database" / "chroma_db"),
+)
+COLLECTION_NAME = "inventory"
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
-def _init_connector():
-    """Initialize AlloyDB Connector, optionally using a shared service account key."""
-    creds = None
+# Inventory seed data — mirrors database/seed_data.sql
+# Loaded here so inventory.py can auto-seed on first run without importing seed.py
+_SEED_ITEMS = [
+    ("Cardboard Shipping Box Large", "Packaging Solutions Inc", "Heavy-duty corrugated cardboard shipping container, 24x18x12 inches"),
+    ("Warehouse Storage Container", "Industrial Supply Co", "Stackable plastic storage bin with snap-lock lid, blue"),
+    ("Product Shipping Boxes", "Acme Packaging", "Medium corrugated boxes for warehouse storage, 18x14x10 inches"),
+    ("Industrial Widget X-9", "Acme Corp", "Heavy-duty industrial coupling for pneumatic systems"),
+    ("Precision Bolt M4", "Global Fasteners Inc", "Stainless steel M4 allen bolt, 20mm length, grade A2-70"),
+    ("Hexagonal Nut M6", "Metro Supply Co", "Galvanized steel hex nut M6, DIN 934 standard"),
+    ("Phillips Head Screw 3x20", "Acme Corp", "Zinc-plated Phillips head wood screw, 3mm x 20mm"),
+    ("Wooden Dowel 10mm", "Craft Materials Ltd", "Hardwood birch dowel rod, 10mm diameter x 300mm length"),
+    ("Rubber Gasket Small", "SealTech Industries", "Buna-N rubber gasket, 25mm OD x 15mm ID, oil resistant"),
+    ("Spring Tension 5kg", "Mechanical Parts Co", "Stainless steel compression spring, 5kg load capacity"),
+    ("Bearing 6204", "Bearings Direct", "Deep groove ball bearing 6204-2RS, 20x47x14mm sealed"),
+    ("Warehouse Shelf Boxes", "Storage Systems Ltd", "Standardized warehouse inventory boxes, corrugated, bulk pack"),
+    ("Inventory Container Units", "Supply Chain Pros", "Modular stackable storage units for warehouse racking"),
+    ("Aluminum Extrusion Bar", "MetalWorks International", "T-slot aluminum extrusion 20x20mm profile, 1 meter length"),
+    ("Cable Tie Pack 200mm", "ElectroParts Depot", "Nylon cable ties, 200mm x 4.8mm, UV resistant black, pack of 100"),
+    ("Hydraulic Hose 1/2 inch", "FluidPower Systems", "High-pressure hydraulic hose, 1/2 inch ID, 3000 PSI rated"),
+    ("Safety Goggles Clear", "WorkSafe Equipment Co", "ANSI Z87.1 rated clear safety goggles, anti-fog coating"),
+    ("Packing Tape Industrial", "Packaging Solutions Inc", "Heavy-duty polypropylene packing tape, 48mm x 100m, clear"),
+    ("Stainless Steel Sheet 1mm", "MetalWorks International", "304 stainless steel sheet, 1mm thickness, 300x300mm"),
+    ("Silicone Sealant Tube", "SealTech Industries", "Industrial-grade RTV silicone sealant, 300ml cartridge, grey"),
+]
 
-    # Option 1: Base64-encoded SA key (for Cloud Run env vars)
-    sa_key_b64 = os.environ.get("ALLOYDB_SA_KEY_B64", "")
-    # Option 2: Path to SA key JSON file (for local/Cloud Shell)
-    sa_key_path = os.environ.get("ALLOYDB_SA_KEY_PATH", "")
-
-    if sa_key_b64:
-        from google.oauth2 import service_account
-        key_data = json.loads(base64.b64decode(sa_key_b64))
-        creds = service_account.Credentials.from_service_account_info(key_data)
-        logger.info("AlloyDB Connector: using shared SA key (base64)")
-    elif sa_key_path:
-        # Resolve relative paths against the .env file's directory (repo root)
-        if not os.path.isabs(sa_key_path):
-            env_file = find_dotenv(usecwd=True)
-            if env_file:
-                sa_key_path = os.path.join(os.path.dirname(env_file), sa_key_path)
-        if os.path.exists(sa_key_path):
-            from google.oauth2 import service_account
-            creds = service_account.Credentials.from_service_account_file(sa_key_path)
-            logger.info(f"AlloyDB Connector: using shared SA key ({sa_key_path})")
-        else:
-            logger.warning(f"AlloyDB Connector: SA key not found at {sa_key_path}, falling back to ADC")
-    else:
-        logger.info("AlloyDB Connector: using Application Default Credentials")
-
-    return Connector(credentials=creds, refresh_strategy="lazy")
-
-
-# Initialize connector once (reuse across requests)
-connector = _init_connector()
-
-
-def get_connection():
-    """Connect to AlloyDB via the Python Connector (IAM-authenticated, no proxy needed)."""
-    # Build instance URI from component env vars (or use pre-built if set)
-    inst_uri = os.environ.get("ALLOYDB_INSTANCE_URI", "")
-    if not inst_uri:
-        # ALLOYDB_PROJECT allows cross-project connections (shared instance scenarios)
-        # Falls back to GOOGLE_CLOUD_PROJECT for single-project setups
-        project = os.environ.get("ALLOYDB_PROJECT", os.environ.get("GOOGLE_CLOUD_PROJECT", ""))
-        region = os.environ.get("ALLOYDB_REGION", "")
-        cluster = os.environ.get("ALLOYDB_CLUSTER", "")
-        instance = os.environ.get("ALLOYDB_INSTANCE", "")
-        if project and region and cluster and instance:
-            inst_uri = f"projects/{project}/locations/{region}/clusters/{cluster}/instances/{instance}"
-        else:
-            raise ValueError(
-                "AlloyDB not configured. Set ALLOYDB_REGION, ALLOYDB_CLUSTER, "
-                "and ALLOYDB_INSTANCE in your .env file."
-            )
-
-    conn = connector.connect(
-        inst_uri,
-        "pg8000",
-        user=os.environ.get("DB_USER", "postgres"),
-        password=os.environ.get("DB_PASS", ""),
-        db=os.environ.get("DB_NAME", "postgres"),
-        ip_type=os.environ.get("ALLOYDB_IP_TYPE", "PUBLIC"),
-    )
-    return conn
+_embedding_model = None
+_chroma_client = None
+_collection = None
 
 
-def find_supplier(embedding_vector: list[float]) -> tuple | None:
-    """
-    Find the nearest supplier for the given part embedding using ScaNN.
-    """
-    logger.info(f"Searching inventory with embedding (dimension: {len(embedding_vector)})")
-
-    # pg8000 converts Python lists to PostgreSQL array format {0.1,0.1,...}
-    # but pgvector expects [0.1,0.1,...] — so we convert to string first
-    embedding_str = "[" + ",".join(str(v) for v in embedding_vector) + "]"
-
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        # ScaNN vector search using cosine distance operator <=>
-        # ORDER BY distance ASC finds the nearest semantic match.
-        # The ScaNN index (idx_inventory_scann) automatically accelerates this.
-        sql = """
-            SELECT part_name, supplier_name,
-                   part_embedding <=> %s::vector AS distance
-            FROM inventory
-            WHERE part_embedding IS NOT NULL
-            ORDER BY distance ASC
-            LIMIT 1;
-        """
-        cursor.execute(sql, (embedding_str,))
-        return cursor.fetchone()
-    except Exception as e:
-        logger.error(f"Database query failed: {e}")
-        raise
-    finally:
-        conn.close()
+def _get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        from sentence_transformers import SentenceTransformer
+        logger.info(f"Loading embedding model: {EMBEDDING_MODEL}")
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        logger.info("Embedding model loaded")
+    return _embedding_model
 
 
-def get_image_embedding(image_bytes: bytes, mime_type: str = "image/jpeg") -> list[float]:
-    """
-    Challenge 1: Generate embedding for an image using Vertex AI multimodalembedding@001.
-    Returns a 1408-dimensional vector for image-based semantic search.
-    NOTE: multimodal embeddings are 1408-dim, so the inventory table must have
-    a separate column or we normalise to 768. We use the text projection (768-dim)
-    by passing the image as a base64 inline part to text-embedding-005 via the
-    multimodal endpoint, keeping the same vector dimension as the table.
-    """
-    import google.auth
-    import google.auth.transport.requests
-    import requests as req_lib
+def _get_collection():
+    global _chroma_client, _collection
+    if _collection is not None:
+        return _collection
 
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-    location = "us-central1"
+    import chromadb
 
-    # Get credentials
-    credentials, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
-    auth_req = google.auth.transport.requests.Request()
-    credentials.refresh(auth_req)
+    Path(CHROMA_DB_PATH).mkdir(parents=True, exist_ok=True)
+    _chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
 
-    b64_image = base64.b64encode(image_bytes).decode("utf-8")
-
-    url = (
-        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project}"
-        f"/locations/{location}/publishers/google/models/multimodalembedding@001:predict"
+    _collection = _chroma_client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
     )
 
-    payload = {
-        "instances": [
-            {
-                "image": {
-                    "bytesBase64Encoded": b64_image,
-                    "mimeType": mime_type,
-                }
-            }
-        ]
-    }
+    if _collection.count() == 0:
+        logger.info("ChromaDB collection is empty — auto-seeding inventory...")
+        _seed_collection(_collection)
 
-    headers = {
-        "Authorization": f"Bearer {credentials.token}",
-        "Content-Type": "application/json",
-    }
-
-    response = req_lib.post(url, json=payload, headers=headers, timeout=30)
-    response.raise_for_status()
-    data = response.json()
-
-    # multimodalembedding@001 returns imageEmbedding (1408-dim)
-    embedding = data["predictions"][0]["imageEmbedding"]
-    logger.info(f"Generated multimodal image embedding with {len(embedding)} dimensions")
-    return embedding
+    logger.info(f"ChromaDB collection ready: {_collection.count()} items at {CHROMA_DB_PATH}")
+    return _collection
 
 
-def find_supplier_by_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> tuple | None:
-    """
-    Challenge 1: Find nearest supplier by searching with an image embedding directly.
-    Uses multimodalembedding@001 → ScaNN cosine search on part_image_embedding column.
-    Falls back to text search if image embedding column doesn't exist yet.
-    """
-    embedding = get_image_embedding(image_bytes, mime_type)
-    embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
+def _seed_collection(collection):
+    """Populate ChromaDB with inventory items and their embeddings."""
+    model = _get_embedding_model()
 
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
+    texts = [f"{name}. {desc}" for name, _, desc in _SEED_ITEMS]
+    ids = [f"item_{i}" for i in range(len(_SEED_ITEMS))]
+    metadatas = [
+        {"part_name": name, "supplier_name": supplier, "description": desc}
+        for name, supplier, desc in _SEED_ITEMS
+    ]
 
-        # Check if part_image_embedding column exists
-        cursor.execute("""
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name='inventory' AND column_name='part_image_embedding';
-        """)
-        has_image_col = cursor.fetchone() is not None
+    logger.info(f"Generating embeddings for {len(texts)} inventory items...")
+    embeddings = model.encode(texts, show_progress_bar=False).tolist()
 
-        if has_image_col:
-            # Full image-based search
-            sql = """
-                SELECT part_name, supplier_name,
-                       part_image_embedding <=> %s::vector AS distance
-                FROM inventory
-                WHERE part_image_embedding IS NOT NULL
-                ORDER BY distance ASC
-                LIMIT 1;
-            """
-            cursor.execute(sql, (embedding_str,))
-            result = cursor.fetchone()
-            if result:
-                logger.info(f"Image-based search result: {result[0]} (distance: {result[2]:.4f})")
-                return result
-
-        # Fallback: use text embedding search
-        logger.info("Image embedding column not found, falling back to text embedding search")
-        # Re-use text embedding via the image's semantic content
-        # by extracting a short text description via a quick Gemini call
-        return None
-
-    except Exception as e:
-        logger.error(f"Image-based database query failed: {e}")
-        raise
-    finally:
-        conn.close()
+    collection.add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=texts,
+        metadatas=metadatas,
+    )
+    logger.info(f"Seeded {len(texts)} items into ChromaDB")
 
 
 def get_embedding(text: str) -> list[float]:
     """
-    Generate embedding for query text using Vertex AI text-embedding-005.
+    Generate embedding for query text using sentence-transformers (local, free).
+    Replaces Vertex AI text-embedding-005.
     """
-    from google import genai
-    from google.genai.types import EmbedContentConfig
+    if not text or not isinstance(text, str):
+        raise ValueError("text must be a non-empty string")
 
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-    logger.debug(f"get_embedding called with text: {text[:50]}...")
-    logger.debug(f"Using GCP project: {project}")
+    model = _get_embedding_model()
+    embedding = model.encode(text, show_progress_bar=False)
+    logger.info(f"Generated embedding: {len(embedding)} dimensions")
+    return embedding.tolist()
 
-    try:
-        # Initialize Gen AI client with Vertex AI
-        client = genai.Client(
-            vertexai=True,
-            project=project,
-            location="us-central1"
-        )
 
-        # Generate embedding using text-embedding-005 (768 dimensions)
-        response = client.models.embed_content(
-            model="text-embedding-005",
-            contents=[text],
-            config=EmbedContentConfig(
-                task_type="RETRIEVAL_QUERY",  # For query embeddings
-                output_dimensionality=768
-            )
-        )
+def find_supplier(embedding_vector: list[float]) -> tuple | None:
+    """
+    Find the nearest supplier for the given embedding using ChromaDB cosine search.
+    Returns (part_name, supplier_name, distance) matching the original AlloyDB signature.
+    ChromaDB cosine distance range: 0 (identical) to 2 (opposite) — same as ScaNN.
+    """
+    logger.info(f"Searching inventory with embedding (dimension: {len(embedding_vector)})")
 
-        embedding_values = response.embeddings[0].values
-        logger.info(f"Generated embedding with {len(embedding_values)} dimensions")
-        return embedding_values
-    except Exception as e:
-        logger.error(f"Embedding API failed: {e}")
-        raise
+    collection = _get_collection()
+    results = collection.query(
+        query_embeddings=[embedding_vector],
+        n_results=1,
+        include=["metadatas", "distances"],
+    )
+
+    if not results["ids"] or not results["ids"][0]:
+        logger.warning("ChromaDB query returned no results")
+        return None
+
+    metadata = results["metadatas"][0][0]
+    distance = results["distances"][0][0]
+
+    part_name = metadata["part_name"]
+    supplier_name = metadata["supplier_name"]
+
+    logger.info(f"Match: {part_name} from {supplier_name} (distance: {distance:.4f})")
+    return (part_name, supplier_name, distance)
+
+
+def find_supplier_by_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> tuple | None:
+    """Image-based supplier search — not supported in the ChromaDB implementation.
+    Returns None so agent_executor.py falls back to text search gracefully."""
+    logger.info("Image-based supplier search not available in ChromaDB mode — falling back to text search")
+    return None
 
 
 def main():
-    """Run standalone verification with a test embedding."""
-    # Load real pre-computed embedding for "Industrial Widget X-9"
-    test_vectors_path = Path(__file__).parent / "test_vectors.json"
-    if test_vectors_path.exists():
-        with open(test_vectors_path) as f:
-            test_data = json.load(f)
-            test_embedding = test_data["industrial_widget_x9"]["embedding"]
-            print(f"Testing with real embedding for: {test_data['industrial_widget_x9']['description']}")
-    else:
-        # Fallback to random if file missing (shouldn't happen in normal use)
-        import random
-        random.seed(42)
-        test_embedding = [random.uniform(-0.1, 0.1) for _ in range(768)]
-        print("Warning: Using fallback random embedding (test_vectors.json not found)")
+    """Standalone verification: search for a test query."""
+    test_query = "cardboard shipping boxes warehouse"
+    print(f"Testing ChromaDB search with query: '{test_query}'")
 
-    result = find_supplier(test_embedding)
+    embedding = get_embedding(test_query)
+    result = find_supplier(embedding)
+
     if result:
-        part_name, supplier_name = result[0], result[1]
-        distance = result[2] if len(result) > 2 else None
+        part_name, supplier_name, distance = result
+        similarity = max(0.0, min(1.0, 1.0 - (distance / 2.0)))
         output = {
             "part": part_name,
             "supplier": supplier_name,
-            "distance": float(distance) if distance else 0.0,
-            "match_confidence": "99.8%",
+            "distance": round(distance, 4),
+            "match_confidence": f"{similarity * 100:.1f}%",
         }
         print(json.dumps(output, indent=2))
     else:
